@@ -510,6 +510,21 @@ OrtStatus *GetMemoryInfoName(OrtMemoryInfo *info, const char **name);
 // implementation.
 OrtStatus *CopyCpuTensorData(OrtValue *src, OrtValue *dst);
 
+// Wraps ort_api->MemoryInfoGetMemType, writing the OrtMemType enum value to
+// *out.
+OrtStatus *GetMemoryInfoMemType(OrtMemoryInfo *info, int *out);
+
+// Wraps ort_api->MemoryInfoGetDeviceType, writing the OrtMemoryInfoDeviceType
+// enum value to *out. Unlike most of the ORT API this can't fail.
+void GetMemoryInfoDeviceType(OrtMemoryInfo *info, int *out);
+
+// Wraps ort_api->GetTensorMemoryInfo followed by
+// ort_api->MemoryInfoGetDeviceType, to report the type of device holding a
+// tensor's data. Unlike the location's name, the device type is the reliable
+// way to tell whether the data is in CPU memory, since several differently
+// named memory locations can be on the CPU.
+OrtStatus *GetTensorMemoryInfoDeviceType(OrtValue *v, int *out);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

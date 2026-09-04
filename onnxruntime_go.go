@@ -2933,10 +2933,25 @@ func (b *IoBinding) SynchronizeBoundOutputs() error {
 type AllocatorType int
 
 const (
-	AllocatorTypeInvalid AllocatorType = C.OrtInvalidAllocator
-	AllocatorTypeDevice  AllocatorType = C.OrtDeviceAllocator
-	AllocatorTypeArena   AllocatorType = C.OrtArenaAllocator
+	AllocatorTypeInvalid  AllocatorType = C.OrtInvalidAllocator
+	AllocatorTypeDevice   AllocatorType = C.OrtDeviceAllocator
+	AllocatorTypeArena    AllocatorType = C.OrtArenaAllocator
+	AllocatorTypeReadOnly AllocatorType = C.OrtReadOnlyAllocator
 )
+
+func (t AllocatorType) String() string {
+	switch t {
+	case AllocatorTypeInvalid:
+		return "OrtInvalidAllocator"
+	case AllocatorTypeDevice:
+		return "OrtDeviceAllocator"
+	case AllocatorTypeArena:
+		return "OrtArenaAllocator"
+	case AllocatorTypeReadOnly:
+		return "OrtReadOnlyAllocator"
+	}
+	return fmt.Sprintf("Unknown AllocatorType: %d", int(t))
+}
 
 // Wraps the C OrtMemType enum, used when creating a MemoryInfo.
 type MemType int
@@ -2947,6 +2962,47 @@ const (
 	MemTypeCPU       MemType = C.OrtMemTypeCPU
 	MemTypeDefault   MemType = C.OrtMemTypeDefault
 )
+
+func (t MemType) String() string {
+	switch t {
+	case MemTypeCPUInput:
+		return "OrtMemTypeCPUInput"
+	// MemTypeCPU is an alias for MemTypeCPUOutput in the C enum, so the two
+	// can't be distinguished (and can't both appear in this switch).
+	case MemTypeCPUOutput:
+		return "OrtMemTypeCPUOutput"
+	case MemTypeDefault:
+		return "OrtMemTypeDefault"
+	}
+	return fmt.Sprintf("Unknown MemType: %d", int(t))
+}
+
+// Wraps the C OrtMemoryInfoDeviceType enum, identifying the type of device a
+// memory location belongs to. Unlike a location's name, of which there can be
+// several referring to memory of the same type, this is the reliable way to
+// check whether memory is on the CPU.
+type MemoryInfoDeviceType int
+
+const (
+	MemoryInfoDeviceTypeCPU  MemoryInfoDeviceType = C.OrtMemoryInfoDeviceType_CPU
+	MemoryInfoDeviceTypeGPU  MemoryInfoDeviceType = C.OrtMemoryInfoDeviceType_GPU
+	MemoryInfoDeviceTypeFPGA MemoryInfoDeviceType = C.OrtMemoryInfoDeviceType_FPGA
+	MemoryInfoDeviceTypeNPU  MemoryInfoDeviceType = C.OrtMemoryInfoDeviceType_NPU
+)
+
+func (t MemoryInfoDeviceType) String() string {
+	switch t {
+	case MemoryInfoDeviceTypeCPU:
+		return "OrtMemoryInfoDeviceType_CPU"
+	case MemoryInfoDeviceTypeGPU:
+		return "OrtMemoryInfoDeviceType_GPU"
+	case MemoryInfoDeviceTypeFPGA:
+		return "OrtMemoryInfoDeviceType_FPGA"
+	case MemoryInfoDeviceTypeNPU:
+		return "OrtMemoryInfoDeviceType_NPU"
+	}
+	return fmt.Sprintf("Unknown MemoryInfoDeviceType: %d", int(t))
+}
 
 // A MemoryInfo describes a memory location tensors can live in, such as the
 // memory of a CUDA device. (The library's default tensors all live in the
@@ -2988,6 +3044,26 @@ func (m *MemoryInfo) Name() (string, error) {
 		return "", statusToError(status)
 	}
 	return C.GoString(name), nil
+}
+
+// Returns the OrtMemType this MemoryInfo was created with.
+func (m *MemoryInfo) GetMemType() (MemType, error) {
+	var memType C.int
+	status := C.GetMemoryInfoMemType(m.o, &memType)
+	if status != nil {
+		return 0, statusToError(status)
+	}
+	return MemType(memType), nil
+}
+
+// Returns the type of device the memory location this MemoryInfo refers to
+// belongs to; for example, MemoryInfoDeviceTypeGPU for a "Cuda" location.
+// Prefer this over Name when checking whether a location is on the CPU, since
+// several differently named locations can be CPU memory.
+func (m *MemoryInfo) GetDeviceType() MemoryInfoDeviceType {
+	var deviceType C.int
+	C.GetMemoryInfoDeviceType(m.o, &deviceType)
+	return MemoryInfoDeviceType(deviceType)
 }
 
 // Frees the resources associated with the MemoryInfo.
@@ -3146,20 +3222,26 @@ func CopyTensors(src, dst []Value) error {
 		dstValues[i] = dst[i].GetInternals().ortValue
 	}
 
+	// Check where every tensor lives before copying anything: the sources
+	// must all share one memory location and the destinations another, and
+	// noticing a mismatch partway through would leave some tensors copied and
+	// others not.
+	srcDevice, e := commonDeviceType(src, "source")
+	if e != nil {
+		return e
+	}
+	dstDevice, e := commonDeviceType(dst, "destination")
+	if e != nil {
+		return e
+	}
+
 	// onnxruntime's CopyTensors delegates to the execution providers'
 	// data-transfer implementations, and no provider implements the copy
 	// between two CPU tensors - so that combination is handled here instead,
 	// which also lets code written against this function run unchanged on
 	// CPU-only systems.
-	srcLocation, e := GetMemoryLocationName(src[0])
-	if e != nil {
-		return fmt.Errorf("Error getting source memory location: %w", e)
-	}
-	dstLocation, e := GetMemoryLocationName(dst[0])
-	if e != nil {
-		return fmt.Errorf("Error getting destination memory location: %w", e)
-	}
-	if (srcLocation == "Cpu") && (dstLocation == "Cpu") {
+	if (srcDevice == MemoryInfoDeviceTypeCPU) &&
+		(dstDevice == MemoryInfoDeviceTypeCPU) {
 		for i := range srcValues {
 			status := C.CopyCpuTensorData(srcValues[i], dstValues[i])
 			if status != nil {
@@ -3178,6 +3260,33 @@ func CopyTensors(src, dst []Value) error {
 	return nil
 }
 
+// Returns the type of device holding the data of every value in the list,
+// which must be the same for all of them. Used by CopyTensors to validate its
+// requirement that all sources reside in one memory location, and all
+// destinations in another, before any data is copied. The kind string only
+// appears in error messages.
+func commonDeviceType(values []Value,
+	kind string) (MemoryInfoDeviceType, error) {
+	first, e := GetMemoryLocationDeviceType(values[0])
+	if e != nil {
+		return 0, fmt.Errorf("Error getting the memory location of %s tensor "+
+			"0: %w", kind, e)
+	}
+	for i := 1; i < len(values); i++ {
+		t, e := GetMemoryLocationDeviceType(values[i])
+		if e != nil {
+			return 0, fmt.Errorf("Error getting the memory location of %s "+
+				"tensor %d: %w", kind, i, e)
+		}
+		if t != first {
+			return 0, fmt.Errorf("All %s tensors must reside in the same "+
+				"memory location, but tensor 0 is in %s memory and tensor "+
+				"%d is in %s memory", kind, first, i, t)
+		}
+	}
+	return first, nil
+}
+
 // Copies the contents of the src tensor into dst; a shorthand for CopyTensors
 // with a single pair.
 func CopyTensor(src, dst Value) error {
@@ -3185,8 +3294,9 @@ func CopyTensor(src, dst Value) error {
 }
 
 // Returns the name of the memory location holding v's underlying data, e.g.
-// "Cpu" or "Cuda". Useful for checking whether a value's data can be accessed
-// from Go, which is only the case for CPU-backed values.
+// "Cpu" or "Cuda". Mostly useful for diagnostics; use
+// GetMemoryLocationDeviceType to check whether a value's data is in CPU
+// memory, and therefore accessible from Go.
 func GetMemoryLocationName(v Value) (string, error) {
 	var name *C.char
 	status := C.GetTensorMemoryInfoName(v.GetInternals().ortValue, &name)
@@ -3194,6 +3304,21 @@ func GetMemoryLocationName(v Value) (string, error) {
 		return "", statusToError(status)
 	}
 	return C.GoString(name), nil
+}
+
+// Returns the type of device holding v's underlying data. This is how to
+// check whether a value's data can be accessed from Go, which is only the
+// case for values in MemoryInfoDeviceTypeCPU memory; unlike the location's
+// name, the device type is unambiguous, since several differently named
+// memory locations can be on the CPU.
+func GetMemoryLocationDeviceType(v Value) (MemoryInfoDeviceType, error) {
+	var deviceType C.int
+	status := C.GetTensorMemoryInfoDeviceType(v.GetInternals().ortValue,
+		&deviceType)
+	if status != nil {
+		return 0, statusToError(status)
+	}
+	return MemoryInfoDeviceType(deviceType), nil
 }
 
 // Creates and returns a ModelMetadata instance for this session's model. The
@@ -3403,17 +3528,26 @@ func createTensorFromOrtValue(v *C.OrtValue) (Value, error) {
 	// data buffer, and dereferencing the pointer GetTensorMutableData returns
 	// for it would crash. Report an error instead; such values must be copied
 	// to a CPU-backed tensor with CopyTensors to be read.
-	var locationName *C.char
-	status = C.GetTensorMemoryInfoName(v, &locationName)
+	var deviceType C.int
+	status = C.GetTensorMemoryInfoDeviceType(v, &deviceType)
 	if status != nil {
 		return nil, fmt.Errorf("Error getting tensor memory location: %w",
 			statusToError(status))
 	}
-	if C.GoString(locationName) != "Cpu" {
+	if MemoryInfoDeviceType(deviceType) != MemoryInfoDeviceTypeCPU {
+		// The location's name is only for the error message, so fall back to
+		// the device type if getting it fails.
+		location := MemoryInfoDeviceType(deviceType).String()
+		var locationName *C.char
+		nameStatus := C.GetTensorMemoryInfoName(v, &locationName)
+		if nameStatus == nil {
+			location = C.GoString(locationName)
+		} else {
+			C.ReleaseOrtStatus(nameStatus)
+		}
 		return nil, fmt.Errorf("The value's data is in non-CPU memory (%s) "+
 			"and can't be converted to a Go-managed Value; copy it to a "+
-			"CPU-backed tensor with CopyTensors instead",
-			C.GoString(locationName))
+			"CPU-backed tensor with CopyTensors instead", location)
 	}
 
 	// Now we start the process of copying the data into a Go-backed OrtValue.

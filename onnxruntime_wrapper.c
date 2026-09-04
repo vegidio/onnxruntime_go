@@ -754,3 +754,27 @@ OrtStatus *CopyCpuTensorData(OrtValue *src, OrtValue *dst) {
   memcpy(dst_data, src_data, src_size);
   return NULL;
 }
+
+OrtStatus *GetMemoryInfoMemType(OrtMemoryInfo *info, int *out) {
+  OrtMemType mem_type = OrtMemTypeDefault;
+  OrtStatus *status = ort_api->MemoryInfoGetMemType(info, &mem_type);
+  if (status) return status;
+  *out = (int) mem_type;
+  return NULL;
+}
+
+void GetMemoryInfoDeviceType(OrtMemoryInfo *info, int *out) {
+  OrtMemoryInfoDeviceType device_type = OrtMemoryInfoDeviceType_CPU;
+  ort_api->MemoryInfoGetDeviceType(info, &device_type);
+  *out = (int) device_type;
+}
+
+OrtStatus *GetTensorMemoryInfoDeviceType(OrtValue *v, int *out) {
+  const OrtMemoryInfo *mem_info = NULL;
+  OrtMemoryInfoDeviceType device_type = OrtMemoryInfoDeviceType_CPU;
+  OrtStatus *status = ort_api->GetTensorMemoryInfo(v, &mem_info);
+  if (status) return status;
+  ort_api->MemoryInfoGetDeviceType(mem_info, &device_type);
+  *out = (int) device_type;
+  return NULL;
+}

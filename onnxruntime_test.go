@@ -2470,6 +2470,38 @@ func BenchmarkCUDASession(b *testing.B) {
 	benchmarkBigSessionWithOptions(b, sessionOptions)
 }
 
+// Checks the String() methods of the memory-related enums, including the
+// fallbacks for values that aren't in the C enums.
+func TestMemoryEnumStrings(t *testing.T) {
+	cases := []struct {
+		got, expected string
+	}{
+		{AllocatorTypeInvalid.String(), "OrtInvalidAllocator"},
+		{AllocatorTypeDevice.String(), "OrtDeviceAllocator"},
+		{AllocatorTypeArena.String(), "OrtArenaAllocator"},
+		{AllocatorTypeReadOnly.String(), "OrtReadOnlyAllocator"},
+		{AllocatorType(1337).String(), "Unknown AllocatorType: 1337"},
+		{MemTypeCPUInput.String(), "OrtMemTypeCPUInput"},
+		// MemTypeCPU is an alias for MemTypeCPUOutput in the C enum.
+		{MemTypeCPUOutput.String(), "OrtMemTypeCPUOutput"},
+		{MemTypeCPU.String(), "OrtMemTypeCPUOutput"},
+		{MemTypeDefault.String(), "OrtMemTypeDefault"},
+		{MemType(1337).String(), "Unknown MemType: 1337"},
+		{MemoryInfoDeviceTypeCPU.String(), "OrtMemoryInfoDeviceType_CPU"},
+		{MemoryInfoDeviceTypeGPU.String(), "OrtMemoryInfoDeviceType_GPU"},
+		{MemoryInfoDeviceTypeFPGA.String(), "OrtMemoryInfoDeviceType_FPGA"},
+		{MemoryInfoDeviceTypeNPU.String(), "OrtMemoryInfoDeviceType_NPU"},
+		{MemoryInfoDeviceType(1337).String(),
+			"Unknown MemoryInfoDeviceType: 1337"},
+	}
+	for _, c := range cases {
+		if c.got != c.expected {
+			t.Errorf("Incorrect string: expected \"%s\", got \"%s\"\n",
+				c.expected, c.got)
+		}
+	}
+}
+
 // Exercises the MemoryInfo, Allocator, DeviceTensor, and CopyTensors
 // plumbing using CPU memory, so that it runs on systems without any GPU.
 func TestMemoryInfoAndDeviceTensorCPU(t *testing.T) {
@@ -2487,6 +2519,19 @@ func TestMemoryInfoAndDeviceTensorCPU(t *testing.T) {
 	if name != "Cpu" {
 		t.Fatalf("Incorrect memory info name: expected \"Cpu\", got \"%s\"\n",
 			name)
+	}
+	memType, e := memInfo.GetMemType()
+	if e != nil {
+		t.Fatalf("Error getting memory info mem type: %s\n", e)
+	}
+	if memType != MemTypeDefault {
+		t.Fatalf("Incorrect memory info mem type: expected %s, got %s\n",
+			MemTypeDefault, memType)
+	}
+	deviceType := memInfo.GetDeviceType()
+	if deviceType != MemoryInfoDeviceTypeCPU {
+		t.Fatalf("Incorrect memory info device type: expected %s, got %s\n",
+			MemoryInfoDeviceTypeCPU, deviceType)
 	}
 
 	session, e := NewDynamicAdvancedSession("test_data/example ż 大 김.onnx",
@@ -2518,6 +2563,15 @@ func TestMemoryInfoAndDeviceTensorCPU(t *testing.T) {
 	if location != "Cpu" {
 		t.Fatalf("Incorrect memory location for a CPU-allocated device "+
 			"tensor: %s\n", location)
+	}
+	tensorDeviceType, e := GetMemoryLocationDeviceType(deviceTensor)
+	if e != nil {
+		t.Fatalf("Error getting the device tensor's device type: %s\n", e)
+	}
+	if tensorDeviceType != MemoryInfoDeviceTypeCPU {
+		t.Fatalf("Incorrect device type for a CPU-allocated device tensor: "+
+			"expected %s, got %s\n", MemoryInfoDeviceTypeCPU,
+			tensorDeviceType)
 	}
 
 	// Round-trip data through the allocator-owned tensor and make sure it
@@ -2613,12 +2667,13 @@ func testCUDADeviceIoBinding(t *testing.T, sessionOptions *SessionOptions) {
 		t.Fatalf("Error creating device output tensor: %s\n", e)
 	}
 	defer deviceOutput.Destroy()
-	location, e := GetMemoryLocationName(deviceInput)
+	inputDeviceType, e := GetMemoryLocationDeviceType(deviceInput)
 	if e != nil {
-		t.Fatalf("Error getting device input's memory location: %s\n", e)
+		t.Fatalf("Error getting the device input's device type: %s\n", e)
 	}
-	if location == "Cpu" {
-		t.Fatalf("Device input tensor is unexpectedly in CPU memory\n")
+	if inputDeviceType != MemoryInfoDeviceTypeGPU {
+		t.Fatalf("Incorrect device type for a CUDA-allocated tensor: "+
+			"expected %s, got %s\n", MemoryInfoDeviceTypeGPU, inputDeviceType)
 	}
 
 	binding, e := session.CreateIoBinding()
@@ -2680,6 +2735,35 @@ func testCUDADeviceIoBinding(t *testing.T, sessionOptions *SessionOptions) {
 				expected, hostOutput.GetData()[0])
 		}
 	}
+
+	// CopyTensors requires all sources to reside in one memory location and
+	// all destinations in another. A list mixing the two must be rejected
+	// before anything is copied, rather than copying the CPU-resident pairs
+	// and then failing (or reading device memory from the host).
+	mixedDst1, e := NewTensor(NewShape(1, 2), []int32{-1, -1})
+	if e != nil {
+		t.Fatalf("Error creating a destination tensor: %s\n", e)
+	}
+	defer mixedDst1.Destroy()
+	mixedDst2, e := NewTensor(NewShape(1, 2), []int32{-1, -1})
+	if e != nil {
+		t.Fatalf("Error creating a destination tensor: %s\n", e)
+	}
+	defer mixedDst2.Destroy()
+	e = CopyTensors([]Value{hostInput, deviceInput},
+		[]Value{mixedDst1, mixedDst2})
+	if e == nil {
+		t.Fatalf("CopyTensors didn't return an error for sources in " +
+			"different memory locations\n")
+	}
+	for i, v := range mixedDst1.GetData() {
+		if v != -1 {
+			t.Fatalf("CopyTensors wrote %d to index %d of a destination "+
+				"tensor even though it rejected the copy\n", v, i)
+		}
+	}
+	t.Logf("Got expected error copying tensors from mixed memory "+
+		"locations: %s\n", e)
 
 	// GetBoundOutputValues must refuse to convert an output residing in
 	// device memory rather than crashing on the inaccessible data pointer.
