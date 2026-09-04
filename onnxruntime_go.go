@@ -6,6 +6,7 @@ package onnxruntime_go
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"unsafe"
 )
@@ -410,6 +411,9 @@ func (o *SessionOptions) AppendExecutionProviderV2(devices []EpDevice,
 		keysPtr, valuesPtr, C.size_t(len(options)))
 	if status != nil {
 		return statusToError(status)
+	}
+	if optionMapEnablesGraphCapture(options) {
+		o.graphCapture = true
 	}
 	return nil
 }
@@ -1595,6 +1599,12 @@ func NewScalar[T TensorData](data T) (*Scalar[T], error) {
 // equivalent.)
 type CUDAProviderOptions struct {
 	o *C.OrtCUDAProviderOptionsV2
+	// Whether the settings applied so far enable CUDA graph capture.
+	// Onnxruntime doesn't report this option back to us (it's missing from
+	// the string GetCUDAProviderOptionsAsString returns), so we note it when
+	// it's set; sessions using these options need to know. See
+	// graphCaptureInfo.
+	graphCapture bool
 }
 
 // Used when setting key-value pair options with certain obnoxious C APIs.
@@ -1636,6 +1646,9 @@ func (o *CUDAProviderOptions) Update(options map[string]string) error {
 		C.int(len(options)))
 	if status != nil {
 		return statusToError(status)
+	}
+	if v, ok := options[cudaGraphCaptureOption]; ok {
+		o.graphCapture = providerOptionEnabled(v)
 	}
 	return nil
 }
@@ -1685,6 +1698,9 @@ func NewCUDAProviderOptions() (*CUDAProviderOptions, error) {
 // function when they are no longer needed.
 type TensorRTProviderOptions struct {
 	o *C.OrtTensorRTProviderOptionsV2
+	// Whether the settings applied so far enable CUDA graph capture; see the
+	// equivalent field in CUDAProviderOptions.
+	graphCapture bool
 }
 
 // Wraps the call to the UpdateTensorRTProviderOptions in the C API. Requires
@@ -1704,6 +1720,9 @@ func (o *TensorRTProviderOptions) Update(options map[string]string) error {
 		C.int(len(options)))
 	if status != nil {
 		return statusToError(status)
+	}
+	if v, ok := options[tensorRTGraphCaptureOption]; ok {
+		o.graphCapture = providerOptionEnabled(v)
 	}
 	return nil
 }
@@ -1766,6 +1785,11 @@ func (m ExecutionMode) String() string {
 // options are no longer needed (after NewAdvancedSession(...) has returned).
 type SessionOptions struct {
 	o *C.OrtSessionOptions
+	// Set when an execution provider has been appended with graph capture
+	// enabled. Sessions created with these options remember it, and check the
+	// tensors they're run with against the requirements it imposes; see
+	// graphCaptureInfo.
+	graphCapture bool
 }
 
 func (o *SessionOptions) Destroy() error {
@@ -1938,11 +1962,21 @@ func (o *SessionOptions) SetMemPattern(isEnabled bool) error {
 // execution provider.
 // See https://github.com/yalue/onnxruntime_go/issues/140 for some discussion
 // of this issue.
+//
+// NOTE: Turning on graph capture, using the "enable_cuda_graph" provider
+// option, requires every input and output of every run to be a DeviceTensor
+// that stays where it is for as long as the session is used. A session
+// created with graph capture enabled returns an error from runs that don't
+// meet that requirement, rather than silently returning an earlier run's
+// output.
 func (o *SessionOptions) AppendExecutionProviderCUDA(
 	cudaOptions *CUDAProviderOptions) error {
 	status := C.AppendExecutionProviderCUDAV2(o.o, cudaOptions.o)
 	if status != nil {
 		return statusToError(status)
+	}
+	if cudaOptions.graphCapture {
+		o.graphCapture = true
 	}
 	return nil
 }
@@ -1952,11 +1986,18 @@ func (o *SessionOptions) AppendExecutionProviderCUDA(
 // TensorRT. Returns an error if your device (or onnxruntime library version)
 // does not support TensorRT. The TensorRTProviderOptions can be destroyed
 // after this.
+//
+// NOTE: The "trt_cuda_graph_enable" provider option comes with the same
+// requirements as CUDA's "enable_cuda_graph"; see the note on
+// AppendExecutionProviderCUDA.
 func (o *SessionOptions) AppendExecutionProviderTensorRT(
 	tensorRTOptions *TensorRTProviderOptions) error {
 	status := C.AppendExecutionProviderTensorRTV2(o.o, tensorRTOptions.o)
 	if status != nil {
 		return statusToError(status)
+	}
+	if tensorRTOptions.graphCapture {
+		o.graphCapture = true
 	}
 	return nil
 }
@@ -2059,6 +2100,9 @@ func (o *SessionOptions) AppendExecutionProvider(providerName string,
 		C.int(len(options)))
 	if status != nil {
 		return statusToError(status)
+	}
+	if optionMapEnablesGraphCapture(options) {
+		o.graphCapture = true
 	}
 	return nil
 }
@@ -2504,6 +2548,10 @@ type AdvancedSession struct {
 	// the C API. Also, these fields aren't used with a DynamicAdvancedSession.
 	inputs  []*C.OrtValue
 	outputs []*C.OrtValue
+	// Non-nil if the session was created with an execution provider that
+	// captures a CUDA graph, in which case the tensors used by each run are
+	// checked against the requirements described on graphCaptureInfo.
+	graphCapture *graphCaptureInfo
 }
 
 func createCSession(onnxData []byte, options *SessionOptions) (*C.OrtSession,
@@ -2621,6 +2669,7 @@ func NewAdvancedSessionWithONNXData(onnxData []byte, inputNames,
 		toReturn.Destroy()
 		return nil, fmt.Errorf("Error creating C session: %w", e)
 	}
+	toReturn.graphCapture = newGraphCaptureInfo(options)
 	return toReturn, nil
 }
 
@@ -2647,6 +2696,7 @@ func NewAdvancedSession(onnxFilePath string, inputNames, outputNames []string,
 		toReturn.Destroy()
 		return nil, fmt.Errorf("Error creating C session from file: %w", e)
 	}
+	toReturn.graphCapture = newGraphCaptureInfo(options)
 	return toReturn, nil
 }
 
@@ -2678,6 +2728,10 @@ func (s *AdvancedSession) Run() error {
 
 // RunWithOptions runs the session using the provided RunOptions.
 func (s *AdvancedSession) RunWithOptions(opts *RunOptions) error {
+	e := s.checkGraphCaptureRun(s.inputs, s.outputs, opts)
+	if e != nil {
+		return e
+	}
 	var optsPtr *C.OrtRunOptions
 	if opts != nil {
 		optsPtr = opts.o
@@ -2698,6 +2752,12 @@ func (s *AdvancedSession) RunWithOptions(opts *RunOptions) error {
 // session creation time.)
 type IoBinding struct {
 	o *C.OrtIoBinding
+	// The values currently bound to each input and output name. Onnxruntime
+	// keeps its own copies of these, and doesn't hand them back; we track
+	// them so that a session capturing a CUDA graph can check them against
+	// the requirements described on graphCaptureInfo before each run.
+	boundInputs  map[string]Value
+	boundOutputs map[string]Value
 }
 
 // Creates and returns an IoBinding instance associated with the session. The
@@ -2711,7 +2771,9 @@ func (s *DynamicAdvancedSession) CreateIoBinding() (*IoBinding, error) {
 		return nil, statusToError(status)
 	}
 	return &IoBinding{
-		o: o,
+		o:            o,
+		boundInputs:  make(map[string]Value),
+		boundOutputs: make(map[string]Value),
 	}, nil
 }
 
@@ -2722,6 +2784,8 @@ func (b *IoBinding) Destroy() error {
 		C.ReleaseIoBinding(b.o)
 		b.o = nil
 	}
+	b.boundInputs = nil
+	b.boundOutputs = nil
 	return nil
 }
 
@@ -2734,6 +2798,7 @@ func (b *IoBinding) BindInput(name string, value Value) error {
 	if status != nil {
 		return statusToError(status)
 	}
+	b.boundInputs[name] = value
 	return nil
 }
 
@@ -2746,6 +2811,7 @@ func (b *IoBinding) BindOutput(name string, value Value) error {
 	if status != nil {
 		return statusToError(status)
 	}
+	b.boundOutputs[name] = value
 	return nil
 }
 
@@ -2880,6 +2946,7 @@ func (b *IoBinding) ClearBoundInputs() {
 		return
 	}
 	C.ClearBoundInputs(b.o)
+	b.boundInputs = make(map[string]Value)
 }
 
 // Clears any previously set outputs. Can't cause errors in the ORT C API.
@@ -2888,6 +2955,7 @@ func (b *IoBinding) ClearBoundOutputs() {
 		return
 	}
 	C.ClearBoundOutputs(b.o)
+	b.boundOutputs = make(map[string]Value)
 }
 
 // Binds the named output to a memory location rather than to a preallocated
@@ -2904,6 +2972,9 @@ func (b *IoBinding) BindOutputToDevice(name string, m *MemoryInfo) error {
 	if status != nil {
 		return statusToError(status)
 	}
+	// Onnxruntime allocates the output itself in this case, so there's no
+	// value of the caller's to keep track of.
+	delete(b.boundOutputs, name)
 	return nil
 }
 
@@ -3321,6 +3392,249 @@ func GetMemoryLocationDeviceType(v Value) (MemoryInfoDeviceType, error) {
 	return MemoryInfoDeviceType(deviceType), nil
 }
 
+// The provider options that turn on graph capture in the two execution
+// providers supporting it. A session created with either of these enabled
+// only produces correct results if it's run in a specific way; see
+// graphCaptureInfo.
+const (
+	cudaGraphCaptureOption     = "enable_cuda_graph"
+	tensorRTGraphCaptureOption = "trt_cuda_graph_enable"
+
+	// The run config entry selecting which captured graph a run uses; runs
+	// with different values here capture and replay separate graphs, each
+	// with its own addresses.
+	cudaGraphAnnotationOption = "gpu_graph_id"
+)
+
+// Reports whether a provider option's value turns the option on. Onnxruntime
+// treats any value other than "0" as enabling an option like these.
+func providerOptionEnabled(value string) bool {
+	return strings.TrimSpace(value) != "0"
+}
+
+// Reports whether the given provider options, as passed to Update or to one
+// of the functions taking options as key-value pairs, enable graph capture.
+func optionMapEnablesGraphCapture(options map[string]string) bool {
+	keys := []string{cudaGraphCaptureOption, tensorRTGraphCaptureOption}
+	for _, key := range keys {
+		v, ok := options[key]
+		if ok && providerOptionEnabled(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// Tracks the extra requirements a session whose execution provider captures a
+// CUDA graph places on the tensors it's run with. Capturing a graph records
+// the device addresses the model reads and writes; every later run replays
+// the recorded work against those same addresses, whatever tensors it was
+// given. So a tensor onnxruntime has to stage through a buffer of its own -
+// anything in CPU memory, or an output onnxruntime allocates itself - is read
+// or written at an address the replay never touches, and a device tensor that
+// isn't the one the graph was captured with is ignored in favor of whatever
+// now occupies the captured address. Neither case is an error as far as
+// onnxruntime is concerned: the run "succeeds", quietly returning the first
+// run's output, an untouched buffer, or garbage.
+//
+// Rather than let that happen, sessions created with graph capture enabled
+// check the tensors of every run against these requirements, and return an
+// error naming the tensor at fault. Note that graph capture additionally
+// requires unchanging input and output shapes, which these checks can't
+// detect.
+type graphCaptureInfo struct {
+	// The device address each input and output was at when it was first used,
+	// keyed by graphCaptureKey.
+	addresses map[string]uintptr
+}
+
+// Returns a graphCaptureInfo if the given options enable graph capture (they
+// may be nil, in which case they don't), and nil otherwise, which is how
+// sessions record that they need no checking.
+func newGraphCaptureInfo(options *SessionOptions) *graphCaptureInfo {
+	if (options == nil) || !options.graphCapture {
+		return nil
+	}
+	return &graphCaptureInfo{
+		addresses: make(map[string]uintptr),
+	}
+}
+
+// Returns the key under which the address of the input or output called name
+// is tracked. The annotation ID is part of the key because runs using
+// different IDs capture and replay separate graphs.
+func graphCaptureKey(annotationID, kind, name string) string {
+	return annotationID + "\x00" + kind + " " + name
+}
+
+// Returns the value of the run config entry selecting which captured graph a
+// run uses, or "" if the run doesn't set one, in which case onnxruntime uses
+// the default graph.
+func graphAnnotationID(opts *RunOptions) string {
+	if opts == nil {
+		return ""
+	}
+	// GetRunConfigEntry returns an error if the entry isn't present, which is
+	// the common case rather than a problem.
+	id, e := opts.GetRunConfigEntry(cudaGraphAnnotationOption)
+	if e != nil {
+		return ""
+	}
+	return id
+}
+
+// Returns the device type of the memory holding v's data.
+func ortValueDeviceType(v *C.OrtValue) (MemoryInfoDeviceType, error) {
+	var deviceType C.int
+	status := C.GetTensorMemoryInfoDeviceType(v, &deviceType)
+	if status != nil {
+		return 0, statusToError(status)
+	}
+	return MemoryInfoDeviceType(deviceType), nil
+}
+
+// Returns the address of v's data. The address is only ever compared, never
+// dereferenced, so this is safe for values in device memory.
+func ortValueDataAddress(v *C.OrtValue) (uintptr, error) {
+	var data unsafe.Pointer
+	status := C.GetTensorMutableData(v, &data)
+	if status != nil {
+		return 0, statusToError(status)
+	}
+	return uintptr(data), nil
+}
+
+// Checks one input or output of a run against the requirements described on
+// graphCaptureInfo, and remembers where a device tensor's data is so later
+// runs can be checked against it. The kind is "input" or "output", and only
+// appears in error messages. Set mustBeOnDevice for values onnxruntime stages
+// through a buffer that moves between runs; a CPU-backed value is fine
+// otherwise, since onnxruntime then reuses one staging buffer for it.
+func (g *graphCaptureInfo) checkValue(annotationID, kind, name string,
+	v *C.OrtValue, mustBeOnDevice bool) error {
+	if v == nil {
+		return fmt.Errorf("The %s \"%s\" wasn't provided, so onnxruntime "+
+			"allocates it, in a different buffer on every run. This session "+
+			"was created with graph capture enabled (the \"%s\" or \"%s\" "+
+			"provider option), which requires every %s to stay at one device "+
+			"address across runs; allocate it once using NewDeviceTensor and "+
+			"pass the same tensor to every run", kind, name,
+			cudaGraphCaptureOption, tensorRTGraphCaptureOption, kind)
+	}
+	deviceType, e := ortValueDeviceType(v)
+	if e != nil {
+		return fmt.Errorf("Error getting the memory location of %s \"%s\": %w",
+			kind, name, e)
+	}
+	if deviceType == MemoryInfoDeviceTypeCPU {
+		if !mustBeOnDevice {
+			return nil
+		}
+		return fmt.Errorf("The %s \"%s\" is in CPU memory, but this session "+
+			"was created with graph capture enabled (the \"%s\" or \"%s\" "+
+			"provider option), which requires the inputs and outputs to be "+
+			"in device memory: the captured graph reads and writes the "+
+			"device addresses it was captured with, while onnxruntime copies "+
+			"a CPU-backed tensor to and from a buffer it allocates anew on "+
+			"every run, so the run would silently return the first run's "+
+			"output or an untouched buffer. Allocate the tensor using "+
+			"NewDeviceTensor, and move data to and from it using CopyTensor",
+			kind, name, cudaGraphCaptureOption, tensorRTGraphCaptureOption)
+	}
+	address, e := ortValueDataAddress(v)
+	if e != nil {
+		return fmt.Errorf("Error getting the data address of %s \"%s\": %w",
+			kind, name, e)
+	}
+	key := graphCaptureKey(annotationID, kind, name)
+	previous, ok := g.addresses[key]
+	if ok && (previous != address) {
+		return fmt.Errorf("The %s \"%s\" is at device address 0x%x, but a "+
+			"previous run of this session used 0x%x. This session was "+
+			"created with graph capture enabled (the \"%s\" or \"%s\" "+
+			"provider option), and a captured graph reads and writes the "+
+			"addresses it was captured with, so a run using a tensor that "+
+			"has moved would silently produce garbage. Reuse the same "+
+			"DeviceTensors for every run, copying new data into them using "+
+			"CopyTensor, rather than allocating new ones per run", kind, name,
+			address, previous, cudaGraphCaptureOption,
+			tensorRTGraphCaptureOption)
+	}
+	g.addresses[key] = address
+	return nil
+}
+
+// Checks the values passed to a run that doesn't use an IoBinding. Both the
+// inputs and the outputs must be device tensors here: without a binding,
+// onnxruntime allocates a fresh device buffer for a CPU-backed output on
+// every run, while the replayed graph writes to the one it captured.
+func (s *AdvancedSession) checkGraphCaptureRun(inputs, outputs []*C.OrtValue,
+	opts *RunOptions) error {
+	g := s.graphCapture
+	if g == nil {
+		return nil
+	}
+	annotationID := graphAnnotationID(opts)
+	for i, v := range inputs {
+		e := g.checkValue(annotationID, "input", C.GoString(s.inputNames[i]),
+			v, true)
+		if e != nil {
+			return e
+		}
+	}
+	for i, v := range outputs {
+		e := g.checkValue(annotationID, "output", C.GoString(s.outputNames[i]),
+			v, true)
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// Checks the values bound to an IoBinding before a run using it. Unlike the
+// runs checked by checkGraphCaptureRun, a CPU-backed output is fine here:
+// onnxruntime keeps one device-side buffer per bound output name, so the
+// replayed graph writes to the buffer it captured, and onnxruntime copies
+// from it into the caller's tensor afterwards.
+func (s *AdvancedSession) checkGraphCaptureBinding(b *IoBinding) error {
+	g := s.graphCapture
+	if g == nil {
+		return nil
+	}
+	e := g.checkBoundValues("input", b.boundInputs, true)
+	if e != nil {
+		return e
+	}
+	return g.checkBoundValues("output", b.boundOutputs, false)
+}
+
+// Checks the values bound under one set of names, in sorted order so that a
+// run with more than one problem always reports the same one.
+func (g *graphCaptureInfo) checkBoundValues(kind string, bound map[string]Value,
+	mustBeOnDevice bool) error {
+	names := make([]string, 0, len(bound))
+	for name := range bound {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		v := bound[name].GetInternals().ortValue
+		if v == nil {
+			return fmt.Errorf("The value bound to %s \"%s\" has been "+
+				"destroyed", kind, name)
+		}
+		// Runs using an IoBinding can't select one of several captured
+		// graphs, since onnxruntime's RunWithBinding is called without run
+		// options here.
+		e := g.checkValue("", kind, name, v, mustBeOnDevice)
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 // Creates and returns a ModelMetadata instance for this session's model. The
 // returned metadata must be freed using its Destroy() function when no longer
 // needed.
@@ -3360,6 +3674,7 @@ func NewDynamicAdvancedSessionWithONNXData(onnxData []byte,
 		s.Destroy()
 		return nil, fmt.Errorf("Error creating C session: %w", e)
 	}
+	s.graphCapture = newGraphCaptureInfo(options)
 	return &DynamicAdvancedSession{
 		s: s,
 	}, nil
@@ -3382,6 +3697,7 @@ func NewDynamicAdvancedSession(onnxFilePath string, inputNames,
 		s.Destroy()
 		return nil, fmt.Errorf("Error creating C session from file: %w", e)
 	}
+	s.graphCapture = newGraphCaptureInfo(options)
 	return &DynamicAdvancedSession{
 		s: s,
 	}, nil
@@ -3649,6 +3965,11 @@ func createMapFromOrtValue(v *C.OrtValue) (*Map, error) {
 // names specified to NewDynamicAdvancedSession. If a given output is nil, it
 // will be allocated and the slice will be modified to include the new Value.
 // Any new Value allocated in this way must be freed by calling Destroy on it.
+//
+// If the session's execution provider captures a CUDA graph, every input and
+// output must be a DeviceTensor that stays at the same address across runs -
+// including the outputs, which therefore can't be left nil here. Runs that
+// would silently produce a stale or empty result return an error instead.
 func (s *DynamicAdvancedSession) Run(inputs, outputs []Value) error {
 	// Delegate to RunWithOptions to unify input/output validation,
 	// optional output auto-allocation and conversion logic.
@@ -3678,6 +3999,10 @@ func (s *DynamicAdvancedSession) RunWithOptions(inputs, outputs []Value, opts *R
 		}
 		outputValues[i] = v.GetInternals().ortValue
 	}
+	e := s.s.checkGraphCaptureRun(inputValues, outputValues, opts)
+	if e != nil {
+		return e
+	}
 	var optsPtr *C.OrtRunOptions
 	if opts != nil {
 		optsPtr = opts.o
@@ -3704,7 +4029,16 @@ func (s *DynamicAdvancedSession) RunWithOptions(inputs, outputs []Value, opts *R
 
 // Runs the session using the given IoBinding instance. The IoBinding must
 // have been created from this session's CreateIoBinding() function.
+//
+// If the session's execution provider captures a CUDA graph, the values bound
+// to its inputs must be DeviceTensors that stay at the same address across
+// runs; a run that would silently produce a stale or empty result returns an
+// error instead. Bound outputs may be CPU-backed.
 func (s *DynamicAdvancedSession) RunWithBinding(b *IoBinding) error {
+	e := s.s.checkGraphCaptureBinding(b)
+	if e != nil {
+		return e
+	}
 	status := C.RunSessionWithBinding(s.s.ortSession, b.o)
 	if status != nil {
 		return statusToError(status)
