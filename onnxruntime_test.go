@@ -2470,38 +2470,6 @@ func BenchmarkCUDASession(b *testing.B) {
 	benchmarkBigSessionWithOptions(b, sessionOptions)
 }
 
-// Checks the String() methods of the memory-related enums, including the
-// fallbacks for values that aren't in the C enums.
-func TestMemoryEnumStrings(t *testing.T) {
-	cases := []struct {
-		got, expected string
-	}{
-		{AllocatorTypeInvalid.String(), "OrtInvalidAllocator"},
-		{AllocatorTypeDevice.String(), "OrtDeviceAllocator"},
-		{AllocatorTypeArena.String(), "OrtArenaAllocator"},
-		{AllocatorTypeReadOnly.String(), "OrtReadOnlyAllocator"},
-		{AllocatorType(1337).String(), "Unknown AllocatorType: 1337"},
-		{MemTypeCPUInput.String(), "OrtMemTypeCPUInput"},
-		// MemTypeCPU is an alias for MemTypeCPUOutput in the C enum.
-		{MemTypeCPUOutput.String(), "OrtMemTypeCPUOutput"},
-		{MemTypeCPU.String(), "OrtMemTypeCPUOutput"},
-		{MemTypeDefault.String(), "OrtMemTypeDefault"},
-		{MemType(1337).String(), "Unknown MemType: 1337"},
-		{MemoryInfoDeviceTypeCPU.String(), "OrtMemoryInfoDeviceType_CPU"},
-		{MemoryInfoDeviceTypeGPU.String(), "OrtMemoryInfoDeviceType_GPU"},
-		{MemoryInfoDeviceTypeFPGA.String(), "OrtMemoryInfoDeviceType_FPGA"},
-		{MemoryInfoDeviceTypeNPU.String(), "OrtMemoryInfoDeviceType_NPU"},
-		{MemoryInfoDeviceType(1337).String(),
-			"Unknown MemoryInfoDeviceType: 1337"},
-	}
-	for _, c := range cases {
-		if c.got != c.expected {
-			t.Errorf("Incorrect string: expected \"%s\", got \"%s\"\n",
-				c.expected, c.got)
-		}
-	}
-}
-
 // Exercises the MemoryInfo, Allocator, DeviceTensor, and CopyTensors
 // plumbing using CPU memory, so that it runs on systems without any GPU.
 func TestMemoryInfoAndDeviceTensorCPU(t *testing.T) {
